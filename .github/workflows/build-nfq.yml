@@ -1,4 +1,4 @@
-name: Build nfnetlink_queue for iStoreOS (ipq60xx, kernel 6.12.112)
+name: Build kernel modules for iStoreOS (ipq60xx, kernel 6.12.112)
 
 on:
   workflow_dispatch:
@@ -21,31 +21,39 @@ jobs:
       - name: 克隆 iStoreOS 源码 (istoreos-25.12)
         run: git clone --depth 1 -b istoreos-25.12 https://github.com/istoreos/istoreos istoreos
 
-      - name: 恢复构建缓存（工具链 + 内核构建树）
+      - name: 恢复构建缓存（host 工具 / 工具链 / 内核构建树）
         uses: actions/cache@v4
         with:
           path: |
+            istoreos/staging_dir/host*
             istoreos/staging_dir/toolchain-*
             istoreos/build_dir/target-aarch64_cortex-a53_musl/linux-qualcommax_ipq60xx
-          key: istoreos2512-build-v1
+          key: istoreos2512-build-v2
           restore-keys: istoreos2512-build-
 
       - name: 启用 ccache 缓存
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-istoreos2512-v1
+          key: ccache-istoreos2512-v2
           restore-keys: ccache-istoreos2512-
 
       - name: 确认内核版本为 6.12.112
         run: grep -E 'LINUX_VERSION-6.12' istoreos/target/linux/generic/kernel-6.12
 
-      - name: 开启 NFQUEUE 内核选项并设定编译目标
+      - name: 开启所需内核选项并设定编译目标
         run: |
           cd istoreos
-          sed -i '/CONFIG_NETFILTER_NETLINK_QUEUE/d' target/linux/generic/config-6.12
-          echo 'CONFIG_NETFILTER_NETLINK_QUEUE=m' >> target/linux/generic/config-6.12
-          tail -2 target/linux/generic/config-6.12
+          CFG=target/linux/generic/config-6.12
+          for opt in \
+            CONFIG_NETFILTER_NETLINK_QUEUE \
+            CONFIG_NETFILTER_NETLINK_LOG \
+            CONFIG_NETFILTER_XT_TARGET_NFQUEUE \
+            CONFIG_NETFILTER_XT_TARGET_NFLOG ; do
+            sed -i "/^${opt}/d; /^# ${opt} /d" "$CFG"
+            echo "${opt}=m" >> "$CFG"
+          done
+          tail -4 "$CFG"
           cat > .config <<'EOF'
           CONFIG_TARGET_qualcommax=y
           CONFIG_TARGET_qualcommax_ipq60xx=y
@@ -65,11 +73,9 @@ jobs:
           TC_TAR="openwrt-toolchain-25.12.6-qualcommax-ipq60xx_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
           URL="https://downloads.openwrt.org/releases/25.12.6/targets/qualcommax/ipq60xx/$TC_TAR"
           wget -q --timeout=180 -O /tmp/tc.tar.zst "$URL" || { echo "下载失败，回退到自动构建"; exit 1; }
-          ls -l /tmp/tc.tar.zst
           mkdir -p /tmp/tcx && tar --zstd -xf /tmp/tc.tar.zst -C /tmp/tcx || exit 1
           SRC=$(find /tmp/tcx -maxdepth 2 -type d -name 'toolchain-*' | head -1)
           [ -z "$SRC" ] && { echo "包内未找到 toolchain 目录"; exit 1; }
-          echo "找到工具链: $SRC"
           rm -rf staging_dir/toolchain-*
           cp -a "$SRC" staging_dir/
           TC=$(ls -d staging_dir/toolchain-* | head -1)
@@ -92,63 +98,63 @@ jobs:
           cd istoreos
           make -j$(nproc) target/linux/prepare V=s
 
-      - name: 编译内核 (生成 Module.symvers)
+      - name: 编译内核与全部模块
         run: |
           cd istoreos
           make -j$(nproc) target/linux/compile V=s
 
-      - name: 编译 nfnetlink_queue 模块
+      - name: 编译 kmod 安装包
+        continue-on-error: true
         run: |
           cd istoreos
+          make -j$(nproc) package/kernel/linux/compile V=s
 
-          # 关键修正1：必须在 target-* 下找内核构建目录。
-          # build_dir/toolchain-*/linux-6.12.* 是工具链的头文件目录，不是目标内核。
+      - name: 收集产物
+        run: |
+          cd istoreos
           KB=$(find build_dir/target-* -maxdepth 3 -type d -name 'linux-6.12.*' | head -1)
-          if [ -z "$KB" ]; then echo "!! 未找到目标内核目录"; ls -la build_dir; exit 1; fi
           echo "内核目录: $KB"
-
-          TC=$(ls -d staging_dir/toolchain-* | head -1)
-          export PATH="$PWD/$TC/bin:$PATH"
-
-          # 关键修正2：交叉编译器前缀必须从内核自身记录的编译信息里取。
-          # 内核是用 aarch64-openwrt-linux-musl-gcc 编的，用非 musl 前缀会报
-          # "-mstack-protector-guard-offset= 缺少参数"。
-          CC0=""
-          if [ -f "$KB/include/generated/compile.h" ]; then
-            CC0=$(sed -n 's/.*LINUX_COMPILER "\([^"]*\)".*/\1/p' "$KB/include/generated/compile.h" | awk '{print $1}' | head -1)
-          fi
-          [ -z "$CC0" ] && CC0=$(ls "$TC/bin" | grep -E -- '-musl-gcc$' | head -1)
-          [ -z "$CC0" ] && CC0=$(ls "$TC/bin" | grep -E -- '-gcc$' | head -1)
-          PFX=${CC0%-gcc}
-          echo "编译器: $CC0"
-          echo "交叉编译前缀: $PFX"
-          command -v "$CC0" || { echo "!! 编译器不在 PATH"; ls "$TC/bin" | head -20; exit 1; }
-
-          # 确认 NFQUEUE 选项已开启，缺失则直接写入目标内核的 .config
-          if grep -q '^CONFIG_NETFILTER_NETLINK_QUEUE=m' "$KB/.config"; then
-            echo "NFQUEUE 选项已开启"
-          else
-            echo "NFQUEUE 选项缺失，写入 .config"
-            sed -i '/CONFIG_NETFILTER_NETLINK_QUEUE/d' "$KB/.config"
-            echo 'CONFIG_NETFILTER_NETLINK_QUEUE=m' >> "$KB/.config"
-          fi
-          grep -E 'CONFIG_NETFILTER_NETLINK_QUEUE' "$KB/.config"
-
-          # 重新生成 autoconf / asm-offsets，然后用与内核一致的编译器编模块
-          make -C "$KB" ARCH=arm64 CROSS_COMPILE="$PFX-" modules_prepare
-          make -C "$KB" ARCH=arm64 CROSS_COMPILE="$PFX-" M=net/netfilter modules -j$(nproc)
-
           mkdir -p /tmp/out
-          KO=$(find "$KB/net/netfilter" -name 'nfnetlink_queue.ko' | head -1)
-          if [ -z "$KO" ]; then echo "!! 未找到模块"; find "$KB" -name 'nfnetlink_queue*'; exit 1; fi
-          cp "$KO" /tmp/out/
-          ls -l /tmp/out/
-          echo "--- vermagic / depends ---"
-          strings /tmp/out/nfnetlink_queue.ko | grep -E 'vermagic|depends'
+
+          # 1) 目标模块：NFQUEUE 相关
+          for m in nfnetlink_queue nfnetlink_log xt_NFQUEUE xt_NFLOG; do
+            KO=$(find "$KB" -name "$m.ko" | head -1)
+            if [ -n "$KO" ]; then cp "$KO" /tmp/out/; echo "已收集: $m.ko"; else echo "缺失: $m.ko"; fi
+          done
+
+          # 2) 全部内核模块打包
+          find "$KB" -name '*.ko' -exec cp --parents {} /tmp/allko/ \; 2>/dev/null || true
+          if [ -d /tmp/allko ]; then
+            tar czf /tmp/out/all-kernel-modules.tar.gz -C /tmp/allko .
+            echo "全部模块数量: $(find /tmp/allko -name '*.ko' | wc -l)"
+          fi
+
+          # 3) kmod 安装包
+          if [ -d bin/packages ]; then
+            tar czf /tmp/out/kmod-packages.tar.gz -C bin/packages .
+            echo "kmod 包数量: $(find bin/packages -name '*.apk' -o -name '*.ipk' | wc -l)"
+          else
+            echo "(未生成 kmod 包)"
+          fi
+
+          ls -lh /tmp/out/
 
       - name: 上传模块
         uses: actions/upload-artifact@v4
         with:
-          name: nfnetlink_queue-ko
-          path: /tmp/out/nfnetlink_queue.ko
-          if-no-files-found: error
+          name: nfqueue-modules
+          path: |
+            /tmp/out/nfnetlink_queue.ko
+            /tmp/out/nfnetlink_log.ko
+            /tmp/out/xt_NFQUEUE.ko
+            /tmp/out/xt_NFLOG.ko
+          if-no-files-found: warn
+
+      - name: 上传全部模块与 kmod 包
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-kernel-modules
+          path: |
+            /tmp/out/all-kernel-modules.tar.gz
+            /tmp/out/kmod-packages.tar.gz
+          if-no-files-found: warn
