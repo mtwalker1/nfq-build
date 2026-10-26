@@ -18,15 +18,24 @@ jobs:
             python3 python3-setuptools python3-dev rsync swig \
             unzip zlib1g-dev file wget zstd pigz ccache
 
+      - name: 克隆 iStoreOS 源码 (istoreos-25.12)
+        run: git clone --depth 1 -b istoreos-25.12 https://github.com/istoreos/istoreos istoreos
+
+      - name: 恢复构建缓存（工具链 + 内核构建树）
+        uses: actions/cache@v4
+        with:
+          path: |
+            istoreos/staging_dir/toolchain-*
+            istoreos/build_dir/target-aarch64_cortex-a53_musl/linux-qualcommax_ipq60xx
+          key: istoreos2512-build-v1
+          restore-keys: istoreos2512-build-
+
       - name: 启用 ccache 缓存
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-istoreos2512-${{ github.run_id }}
+          key: ccache-istoreos2512-v1
           restore-keys: ccache-istoreos2512-
-
-      - name: 克隆 iStoreOS 源码 (istoreos-25.12)
-        run: git clone --depth 1 -b istoreos-25.12 https://github.com/istoreos/istoreos istoreos
 
       - name: 确认内核版本为 6.12.112
         run: grep -E 'LINUX_VERSION-6.12' istoreos/target/linux/generic/kernel-6.12
@@ -34,7 +43,6 @@ jobs:
       - name: 开启 NFQUEUE 内核选项并设定编译目标
         run: |
           cd istoreos
-          # 内核默认未编译 NFQUEUE，这里打开为模块（注意配置文件名是 config-6.12）
           sed -i '/CONFIG_NETFILTER_NETLINK_QUEUE/d' target/linux/generic/config-6.12
           echo 'CONFIG_NETFILTER_NETLINK_QUEUE=m' >> target/linux/generic/config-6.12
           tail -2 target/linux/generic/config-6.12
@@ -51,6 +59,9 @@ jobs:
         continue-on-error: true
         run: |
           cd istoreos
+          if [ -d "$(ls -d staging_dir/toolchain-* 2>/dev/null | head -1)" ]; then
+            echo "已有工具链（来自缓存），跳过下载"; exit 0
+          fi
           TC_TAR="openwrt-toolchain-25.12.6-qualcommax-ipq60xx_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
           URL="https://downloads.openwrt.org/releases/25.12.6/targets/qualcommax/ipq60xx/$TC_TAR"
           wget -q --timeout=180 -O /tmp/tc.tar.zst "$URL" || { echo "下载失败，回退到自动构建"; exit 1; }
@@ -65,7 +76,6 @@ jobs:
           mkdir -p "$TC/stamp"
           touch "$TC/stamp/.toolchain_compiled" "$TC/stamp/.toolchain_installed"
           echo "工具链就位: $TC"
-          ls "$TC/bin" | grep -E 'gcc$' | head -3
 
       - name: 构建 host 工具
         run: |
@@ -76,13 +86,6 @@ jobs:
         run: |
           cd istoreos
           make -j$(nproc) toolchain/install V=s
-
-      - name: 确认交叉编译器存在
-        run: |
-          cd istoreos
-          TC=$(ls -d staging_dir/toolchain-* | head -1)
-          echo "toolchain: $TC"
-          ls "$TC/bin" | grep -E 'gcc$' | head -5
 
       - name: 准备内核构建树
         run: |
@@ -97,19 +100,50 @@ jobs:
       - name: 编译 nfnetlink_queue 模块
         run: |
           cd istoreos
-          KB=$(find build_dir -maxdepth 4 -type d -name 'linux-6.12.*' | head -1)
+
+          # 关键修正1：必须在 target-* 下找内核构建目录。
+          # build_dir/toolchain-*/linux-6.12.* 是工具链的头文件目录，不是目标内核。
+          KB=$(find build_dir/target-* -maxdepth 3 -type d -name 'linux-6.12.*' | head -1)
+          if [ -z "$KB" ]; then echo "!! 未找到目标内核目录"; ls -la build_dir; exit 1; fi
           echo "内核目录: $KB"
+
           TC=$(ls -d staging_dir/toolchain-* | head -1)
           export PATH="$PWD/$TC/bin:$PATH"
-          PFX=$(ls "$TC/bin" | grep -E '^[a-z0-9_-]+-gcc$' | head -1 | sed 's/-gcc$//')
+
+          # 关键修正2：交叉编译器前缀必须从内核自身记录的编译信息里取。
+          # 内核是用 aarch64-openwrt-linux-musl-gcc 编的，用非 musl 前缀会报
+          # "-mstack-protector-guard-offset= 缺少参数"。
+          CC0=""
+          if [ -f "$KB/include/generated/compile.h" ]; then
+            CC0=$(sed -n 's/.*LINUX_COMPILER "\([^"]*\)".*/\1/p' "$KB/include/generated/compile.h" | awk '{print $1}' | head -1)
+          fi
+          [ -z "$CC0" ] && CC0=$(ls "$TC/bin" | grep -E -- '-musl-gcc$' | head -1)
+          [ -z "$CC0" ] && CC0=$(ls "$TC/bin" | grep -E -- '-gcc$' | head -1)
+          PFX=${CC0%-gcc}
+          echo "编译器: $CC0"
           echo "交叉编译前缀: $PFX"
-          grep -E 'CONFIG_NETFILTER_NETLINK_QUEUE' "$KB/.config" || echo "(内核 .config 中未找到该选项!)"
+          command -v "$CC0" || { echo "!! 编译器不在 PATH"; ls "$TC/bin" | head -20; exit 1; }
+
+          # 确认 NFQUEUE 选项已开启，缺失则直接写入目标内核的 .config
+          if grep -q '^CONFIG_NETFILTER_NETLINK_QUEUE=m' "$KB/.config"; then
+            echo "NFQUEUE 选项已开启"
+          else
+            echo "NFQUEUE 选项缺失，写入 .config"
+            sed -i '/CONFIG_NETFILTER_NETLINK_QUEUE/d' "$KB/.config"
+            echo 'CONFIG_NETFILTER_NETLINK_QUEUE=m' >> "$KB/.config"
+          fi
+          grep -E 'CONFIG_NETFILTER_NETLINK_QUEUE' "$KB/.config"
+
+          # 重新生成 autoconf / asm-offsets，然后用与内核一致的编译器编模块
+          make -C "$KB" ARCH=arm64 CROSS_COMPILE="$PFX-" modules_prepare
           make -C "$KB" ARCH=arm64 CROSS_COMPILE="$PFX-" M=net/netfilter modules -j$(nproc)
+
           mkdir -p /tmp/out
           KO=$(find "$KB/net/netfilter" -name 'nfnetlink_queue.ko' | head -1)
-          if [ -z "$KO" ]; then echo "!! 未找到模块"; find "$KB" -name 'nfnetlink_queue*' ; exit 1; fi
+          if [ -z "$KO" ]; then echo "!! 未找到模块"; find "$KB" -name 'nfnetlink_queue*'; exit 1; fi
           cp "$KO" /tmp/out/
-          echo "--- vermagic ---"
+          ls -l /tmp/out/
+          echo "--- vermagic / depends ---"
           strings /tmp/out/nfnetlink_queue.ko | grep -E 'vermagic|depends'
 
       - name: 上传模块
