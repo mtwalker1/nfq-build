@@ -34,8 +34,10 @@ jobs:
       - name: 开启 NFQUEUE 内核选项并设定编译目标
         run: |
           cd istoreos
-          # 内核默认未编译 NFQUEUE，这里打开为模块
-          echo 'CONFIG_NETFILTER_NETLINK_QUEUE=m' >> target/linux/generic/config-default
+          # 内核默认未编译 NFQUEUE，这里打开为模块（注意配置文件名是 config-6.12）
+          sed -i '/CONFIG_NETFILTER_NETLINK_QUEUE/d' target/linux/generic/config-6.12
+          echo 'CONFIG_NETFILTER_NETLINK_QUEUE=m' >> target/linux/generic/config-6.12
+          tail -2 target/linux/generic/config-6.12
           cat > .config <<'EOF'
           CONFIG_TARGET_qualcommax=y
           CONFIG_TARGET_qualcommax_ipq60xx=y
@@ -44,7 +46,43 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           make defconfig
-          grep -E 'NETFILTER_NETLINK_QUEUE' build_dir/target-*/linux-*/linux-6.12.*/.config || echo "(prepare 前暂无 .config，属正常)"
+
+      - name: 尝试下载官方预编译工具链（加速，失败则自动构建）
+        continue-on-error: true
+        run: |
+          cd istoreos
+          TC_TAR="openwrt-toolchain-25.12.6-qualcommax-ipq60xx_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
+          URL="https://downloads.openwrt.org/releases/25.12.6/targets/qualcommax/ipq60xx/$TC_TAR"
+          wget -q --timeout=180 -O /tmp/tc.tar.zst "$URL" || { echo "下载失败，回退到自动构建"; exit 1; }
+          ls -l /tmp/tc.tar.zst
+          mkdir -p /tmp/tcx && tar --zstd -xf /tmp/tc.tar.zst -C /tmp/tcx || exit 1
+          SRC=$(find /tmp/tcx -maxdepth 2 -type d -name 'toolchain-*' | head -1)
+          [ -z "$SRC" ] && { echo "包内未找到 toolchain 目录"; exit 1; }
+          echo "找到工具链: $SRC"
+          rm -rf staging_dir/toolchain-*
+          cp -a "$SRC" staging_dir/
+          TC=$(ls -d staging_dir/toolchain-* | head -1)
+          mkdir -p "$TC/stamp"
+          touch "$TC/stamp/.toolchain_compiled" "$TC/stamp/.toolchain_installed"
+          echo "工具链就位: $TC"
+          ls "$TC/bin" | grep -E 'gcc$' | head -3
+
+      - name: 构建 host 工具
+        run: |
+          cd istoreos
+          make -j$(nproc) tools/install V=s
+
+      - name: 构建交叉工具链（已就位则跳过）
+        run: |
+          cd istoreos
+          make -j$(nproc) toolchain/install V=s
+
+      - name: 确认交叉编译器存在
+        run: |
+          cd istoreos
+          TC=$(ls -d staging_dir/toolchain-* | head -1)
+          echo "toolchain: $TC"
+          ls "$TC/bin" | grep -E 'gcc$' | head -5
 
       - name: 准备内核构建树
         run: |
@@ -65,6 +103,7 @@ jobs:
           export PATH="$PWD/$TC/bin:$PATH"
           PFX=$(ls "$TC/bin" | grep -E '^[a-z0-9_-]+-gcc$' | head -1 | sed 's/-gcc$//')
           echo "交叉编译前缀: $PFX"
+          grep -E 'CONFIG_NETFILTER_NETLINK_QUEUE' "$KB/.config" || echo "(内核 .config 中未找到该选项!)"
           make -C "$KB" ARCH=arm64 CROSS_COMPILE="$PFX-" M=net/netfilter modules -j$(nproc)
           mkdir -p /tmp/out
           KO=$(find "$KB/net/netfilter" -name 'nfnetlink_queue.ko' | head -1)
